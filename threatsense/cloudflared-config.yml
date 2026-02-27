@@ -1,0 +1,26 @@
+# Cloudflare Tunnel Configuration for ThreatSense
+# ===================================================
+# Replace TUNNEL_ID_HERE with the actual tunnel ID after creation
+# (you'll get this from: cloudflared tunnel create threatsense)
+
+tunnel: TUNNEL_ID_HERE
+credentials-file: C:\Users\pragn\.cloudflared\TUNNEL_ID_HERE.json
+
+ingress:
+  # Frontend: mysrkr.online → Vite dev server (port 5173)
+  - hostname: mysrkr.online
+    service: http://localhost:5173
+
+  # Frontend www: www.mysrkr.online → Vite dev server (port 5173)
+  - hostname: www.mysrkr.online
+    service: http://localhost:5173
+
+  # Backend API + WebSocket: api.mysrkr.online → FastAPI (port 8000)
+  - hostname: api.mysrkr.online
+    service: http://localhost:8000
+    originRequest:
+      # Required for WebSocket support
+      noTLSVerify: false
+
+  # Catch-all rule (required by cloudflared)
+  - service: http_status:404

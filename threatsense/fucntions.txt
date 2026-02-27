@@ -1,0 +1,603 @@
+================================================================================
+                    THREATSENSE - COMPLETE PROJECT DOCUMENTATION
+              Post-Login Cyber Attack Detection System (MVP Backend)
+================================================================================
+
+PROJECT OVERVIEW:
+ThreatSense is an AI-powered cybersecurity system that detects post-login 
+anomalous behavior in real-time. It monitors user actions after they log in, 
+analyzes their behavior using Machine Learning, maintains a rolling Risk Score, 
+and can instantly terminate suspicious sessions via WebSocket communication.
+
+TECH STACK:
+- Backend Framework : FastAPI (Python)
+- ML Engine         : Scikit-Learn (Random Forest Classifier)
+- Fast Memory       : Redis (Real-time session & risk management)
+- Permanent Storage : MongoDB (Long-term security event logs)
+- Email Service     : SendGrid (Verification emails)
+- Real-Time Comms   : WebSockets (Instant session termination)
+
+================================================================================
+                         BACKEND ARCHITECTURE FLOW
+================================================================================
+
+The system follows this flow:
+
+  [User Login] --> [Email Verification] --> [Continuous Monitoring] --> [Risk Response]
+
+  Step 1: User submits username + email via POST /api/auth/login
+  Step 2: Backend generates unique tokens and sends verification email
+  Step 3: User session is set to "PENDING" in Redis
+  Step 4: User clicks "Yes, I'm In" link --> Session becomes "ACTIVE"
+     OR   User clicks "This is not me" --> Session is TERMINATED immediately
+  Step 5: Once ACTIVE, every user action is sent to POST /api/actions/log
+  Step 6: Each action is analyzed by the ML model for anomalies
+  Step 7: Risk Score is updated in Redis with decay logic
+  Step 8: If Risk Score >= 70, session is force-terminated via WebSocket
+  Step 9: Termination events are permanently logged in MongoDB
+
+================================================================================
+                         FILE-BY-FILE FUNCTION BREAKDOWN
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE 1: backend/main.py (THE ENTRY POINT - The "Brain Stem")
+--------------------------------------------------------------------------------
+Purpose: This is the main entry point that starts the entire FastAPI application.
+         It initializes all services (ML, Redis, MongoDB) and registers all API 
+         routes. Think of it as the "Power Button" of the backend.
+
+FUNCTIONS:
+
+  1. lifespan(app: FastAPI)
+     - Type: Async Context Manager
+     - Purpose: Manages the startup and shutdown lifecycle of the application.
+     - On Startup:
+       * Initializes the AnomalyDetector (ML Model) as a global variable.
+       * Initializes the RedisService (Fast Memory) as a global variable.
+       * Connects to MongoDB (Permanent Storage) via mongodb_service.connect().
+     - On Shutdown:
+       * Closes the MongoDB connection via mongodb_service.close().
+       * Prints "Shutting down ThreatSense Backend..."
+
+  2. read_root()
+     - Type: GET endpoint at "/"
+     - Purpose: A simple health check. If you visit http://localhost:8000/, 
+       it returns {"status": "ThreatSense MVP Backend is running"}.
+     - Used For: Quickly checking if the server is alive.
+
+GLOBAL VARIABLES:
+  - detector: Holds the AnomalyDetector instance (ML Model).
+  - redis_client: Holds the RedisService instance (Fast Memory).
+
+MIDDLEWARE:
+  - CORSMiddleware: Allows the React frontend (running on a different port) 
+    to communicate with this backend without being blocked by the browser.
+
+ROUTERS REGISTERED:
+  - auth_router    --> /api/auth/      (Login, Verify, Report Compromise)
+  - actions_router --> /api/actions/   (Log User Actions, ML Analysis)
+  - ws_router      --> /ws/            (WebSocket connections)
+
+--------------------------------------------------------------------------------
+FILE 2: backend/core/config.py (THE SETTINGS - The "Control Panel")
+--------------------------------------------------------------------------------
+Purpose: Stores all configuration values (API keys, database URLs, secrets) 
+         in one central place. Uses Pydantic's BaseSettings to automatically 
+         read from environment variables or a .env file.
+
+CLASSES:
+
+  1. Settings(BaseSettings)
+     - Purpose: Defines all configurable values for the project.
+     - Attributes:
+       * SENDGRID_API_KEY (str): The API key for SendGrid email service.
+         Default: "SG.placeholder" (prints links to terminal instead of sending).
+       * REDIS_URL (str): The connection string for Redis.
+         Default: "redis://localhost:6379/0"
+       * MONGODB_URL (str): The connection string for MongoDB.
+         Default: "mongodb://localhost:27017"
+       * JWT_SECRET (str): Secret key for future JWT token signing.
+         Default: "super_secret_key"
+
+     - Inner Class: Config
+       * env_file = ".env" --> Tells Pydantic to look for a .env file in the 
+         project root for overriding default values.
+
+SINGLETON:
+  - settings = Settings() --> One global instance used by all other files.
+
+--------------------------------------------------------------------------------
+FILE 3: backend/api/auth.py (THE GATEKEEPER - Authentication Endpoints)
+--------------------------------------------------------------------------------
+Purpose: Handles the entire login and email verification flow. This is the 
+         "front door" of the security system. It manages user sessions and 
+         generates unique magic links for email verification.
+
+CLASSES:
+
+  1. LoginRequest(BaseModel)
+     - Purpose: Validates incoming login data from the frontend.
+     - Fields:
+       * user_id (str): The username of the person logging in.
+       * email (str): The email address to send verification links to.
+
+FUNCTIONS:
+
+  1. login(request: LoginRequest)
+     - Type: POST endpoint at /api/auth/login
+     - Purpose: Initiates the login process.
+     - Flow:
+       a) Calls email_service.send_verification_email() to generate unique 
+          tokens and print/send the magic links.
+       b) Sets the user's session status to "PENDING" in Redis with a 
+          5-minute expiration (ex=300).
+       c) Stores both the verify_token and kill_token in Redis, linked to 
+          the user_id, also with 5-minute expiration.
+       d) Returns a JSON message telling the user to check their email.
+     - Redis Keys Created:
+       * "session:{user_id}" = "PENDING"
+       * "token:{verify_token}" = user_id
+       * "token:{kill_token}" = user_id
+
+  2. verify(token: str, user_id: str)
+     - Type: GET endpoint at /api/auth/verify/{token}
+     - Purpose: Called when user clicks the "Yes, I'm In" link from email.
+     - Flow:
+       a) Looks up the token in Redis to find the associated user_id.
+       b) If the token doesn't match the user_id, returns 403 Forbidden.
+       c) If valid, updates the session status to "ACTIVE" with a 24-hour 
+          expiration (ex=86400).
+       d) Deletes the used token from Redis (single-use security).
+       e) Returns a success message granting access.
+     - Security: Tokens are single-use and expire after 5 minutes.
+
+  3. report_compromise(token: str, user_id: str)
+     - Type: GET endpoint at /api/auth/report_compromise/{token}
+     - Purpose: Called when user clicks "This is not me" link from email.
+     - Flow:
+       a) Validates the kill_token against the user_id in Redis.
+       b) If valid, calls redis_client.clear_session() to delete ALL data 
+          for that user (actions, risk score, session status).
+       c) Calls manager.send_termination() to send a WebSocket message to 
+          the frontend, instantly locking the screen.
+       d) Returns a SECURITY ALERT message.
+     - Critical: This is the "Kill Switch" of the entire system.
+
+MODULE-LEVEL OBJECTS:
+  - redis_client = RedisService() --> Local Redis instance for session management.
+  - router = APIRouter() --> FastAPI router for grouping auth endpoints.
+
+--------------------------------------------------------------------------------
+FILE 4: backend/api/actions.py (THE ANALYZER - User Action Processing)
+--------------------------------------------------------------------------------
+Purpose: Receives every user action from the frontend, runs it through the 
+         ML model for anomaly detection, updates the risk score, and decides 
+         whether to terminate the session.
+
+CLASSES:
+
+  1. UserAction(BaseModel)
+     - Purpose: Validates and type-checks incoming action data.
+     - Fields:
+       * user (str): Username, must be 1-100 characters (Field validation).
+       * log_type (str): Type of action (e.g., "file_access", "login").
+       * department (str): User's department (e.g., "Finance", "HR").
+       * file_accessed (str): Name of the file or resource accessed.
+       * location (str): IP address or location of the user.
+       * device_type (str): Type of device (e.g., "laptop", "mobile").
+       * timestamp (datetime): Auto-generated if not provided.
+
+     VALIDATORS:
+       * parse_timestamp(cls, v) [pre=True]
+         - Purpose: Ensures the timestamp is always a valid datetime object.
+         - Logic: If the input is "string" (Swagger default), empty, or 
+           invalid, it automatically replaces it with datetime.utcnow().
+         - This prevents the ValueError crash we encountered earlier.
+
+FUNCTIONS:
+
+  1. log_action(action: UserAction)
+     - Type: POST endpoint at /api/actions/log
+     - Purpose: The main "Brain" of the detection system. Processes every 
+       user action through the full security pipeline.
+     - Flow:
+       a) Imports detector and redis_client from main.py (global instances).
+       b) Retrieves the user's recent action history from Redis using 
+          redis_client.get_user_history().
+       c) Converts the action to a dictionary and ensures timestamp is 
+          in ISO format string for the ML model.
+       d) Passes the action and history to detector.predict() for ML analysis.
+       e) Calculates risk_increment:
+          - If ML says is_anomaly=True --> increment by 20 points.
+          - If ML says is_anomaly=False --> increment by (anomaly_score / 2).
+       f) Calls redis_client.update_risk_score() to apply decay and add 
+          the new increment.
+       g) Stores the current action in the Redis sliding window using 
+          redis_client.store_action().
+       h) Checks if risk score >= 70 (termination threshold):
+          - If YES: Logs the event to MongoDB permanently via 
+            mongodb_service.log_security_event().
+          - Sends a TERMINATE signal to the frontend via WebSocket using 
+            manager.send_termination().
+       i) Returns the analysis results, current risk score, and whether 
+          the action_required is "TERMINATE" or "CONTINUE".
+
+--------------------------------------------------------------------------------
+FILE 5: backend/api/websocket.py (THE ALARM - Real-Time Communication)
+--------------------------------------------------------------------------------
+Purpose: Manages persistent WebSocket connections with the frontend. This 
+         allows the backend to PUSH messages to the frontend instantly, 
+         without the frontend having to ask. Used primarily for the 
+         "Kill Switch" termination signal.
+
+CLASSES:
+
+  1. ConnectionManager
+     - Purpose: Tracks all active WebSocket connections by user_id.
+     
+     METHODS:
+
+     a) __init__(self)
+        - Initializes an empty dictionary: active_connections = {}
+        - Key: user_id (str), Value: WebSocket object.
+
+     b) connect(self, user_id: str, websocket: WebSocket)
+        - Purpose: Accepts a new WebSocket connection and registers it.
+        - Flow: Calls websocket.accept() and stores the connection in 
+          the active_connections dictionary.
+
+     c) disconnect(self, user_id: str)
+        - Purpose: Removes a user's WebSocket connection from the tracker.
+        - Called when: The frontend closes the browser tab or loses connection.
+
+     d) send_termination(self, user_id: str)
+        - Purpose: Sends a JSON "TERMINATE_SESSION" message to a specific 
+          user's frontend via their WebSocket connection.
+        - Message Sent: {"action": "TERMINATE_SESSION", "reason": "Security Alert: High Risk Score"}
+        - Used By: Both report_compromise() in auth.py and log_action() in actions.py.
+
+FUNCTIONS:
+
+  1. websocket_endpoint(websocket: WebSocket, user_id: str)
+     - Type: WebSocket endpoint at /ws/ws/{user_id}
+     - Purpose: Keeps a persistent connection open with each user's frontend.
+     - Flow:
+       a) Accepts the connection via manager.connect().
+       b) Enters an infinite loop waiting for messages (keeps connection alive).
+       c) When the connection drops (WebSocketDisconnect), calls 
+          manager.disconnect() to clean up.
+
+MODULE-LEVEL OBJECTS:
+  - manager = ConnectionManager() --> Singleton used by auth.py and actions.py.
+
+--------------------------------------------------------------------------------
+FILE 6: backend/services/redis_service.py (THE FAST MEMORY - Real-Time Data)
+--------------------------------------------------------------------------------
+Purpose: Manages all interactions with Redis, the "Short-Term Memory" of the 
+         system. Stores user sessions, action history (sliding window), and 
+         risk scores. Includes a "Fake Memory" fallback using a Python 
+         dictionary if Redis is not available.
+
+CLASSES:
+
+  1. RedisService
+     - Purpose: Provides a unified interface for all Redis operations.
+     
+     METHODS:
+
+     a) __init__(self)
+        - Purpose: Attempts to connect to Redis. If Redis is not running, 
+          activates "Fake Memory" mode using a Python dictionary.
+        - Logic:
+          * Tries redis.from_url() and self.client.ping().
+          * If successful: self.use_fake = False.
+          * If fails: self.use_fake = True, self.fake_db = {}.
+        - Config: action_window_ttl = 3600 (1 hour), risk_decay_rate = 0.95.
+
+     b) store_action(self, user_id, action_details)
+        - Purpose: Stores a user action in a Redis List (sliding window).
+        - Redis Command: RPUSH (append to end of list).
+        - Limits: Keeps only the last 100 actions (LTRIM).
+        - TTL: 1 hour (actions older than 1 hour are auto-deleted).
+        - Fake Mode: Appends to a Python list in self.fake_db.
+
+     c) get_user_history(self, user_id)
+        - Purpose: Retrieves all recent actions for a user from Redis.
+        - Redis Command: LRANGE (get all items in the list).
+        - Returns: A list of dictionaries (parsed from JSON strings).
+        - Used By: log_action() in actions.py to feed history to the ML model.
+
+     d) update_risk_score(self, user_id, increment: float)
+        - Purpose: Updates the user's risk score with decay logic.
+        - Formula: new_score = (current_score * 0.95) + increment
+        - Redis Command: INCRBYFLOAT (atomic float increment).
+        - The 0.95 decay means old risk naturally decreases over time, 
+          so a single suspicious action won't haunt a user forever.
+        - Returns: The new risk score rounded to 2 decimal places.
+
+     e) get_risk_score(self, user_id)
+        - Purpose: Retrieves the current risk score for a user.
+        - Returns: A float value, or 0.0 if no score exists.
+
+     f) set_val(self, key, value, ex=None)
+        - Purpose: Generic key-value SET operation with optional expiration.
+        - Used By: auth.py for storing session states and tokens.
+        - Fake Mode: Stores in self.fake_db dictionary.
+
+     g) get_val(self, key)
+        - Purpose: Generic key-value GET operation.
+        - Used By: auth.py for retrieving session states and tokens.
+        - Fake Mode: Reads from self.fake_db dictionary.
+
+     h) delete_val(self, key)
+        - Purpose: Generic key DELETE operation.
+        - Used By: auth.py for cleaning up used tokens.
+        - Fake Mode: Pops from self.fake_db dictionary.
+
+     i) clear_session(self, user_id)
+        - Purpose: Nuclear option. Deletes ALL data for a user.
+        - Deletes: actions:{user_id}, risk:{user_id}, session:{user_id}.
+        - Used By: report_compromise() in auth.py (the "Kill Switch").
+
+--------------------------------------------------------------------------------
+FILE 7: backend/services/email_service.py (THE MESSENGER - Email Verification)
+--------------------------------------------------------------------------------
+Purpose: Handles the creation and sending of verification emails with unique 
+         "Magic Links." Uses SendGrid as the email provider. If no API key 
+         is configured, it prints the links to the terminal instead.
+
+CLASSES:
+
+  1. EmailService
+     - Purpose: Generates security tokens and sends verification emails.
+     
+     METHODS:
+
+     a) __init__(self)
+        - Purpose: Initializes the SendGrid client.
+        - Logic: If the API key contains "placeholder," the client is set 
+          to None (no real emails will be sent; links print to terminal).
+        - Sets base_url to "http://localhost:8000" for link generation.
+
+     b) send_verification_email(self, to_email: str, user_id: str)
+        - Purpose: Generates unique UUID tokens and constructs the magic links.
+        - Flow:
+          a) Generates verify_token (UUID4) for the "Yes, I'm In" button.
+          b) Generates kill_token (UUID4) for the "This is not me" button.
+          c) Constructs the yes_link: /api/auth/verify/{verify_token}?user_id={user_id}
+          d) Constructs the no_link: /api/auth/report_compromise/{kill_token}?user_id={user_id}
+          e) Prints both links to the terminal (always, for debugging).
+          f) If SendGrid client exists, formats an HTML email with styled 
+             green ("Yes") and red ("No") buttons and sends it.
+          g) Returns both tokens as a dictionary: 
+             {"verify_token": ..., "kill_token": ...}
+        - Error Handling: If SendGrid fails, prints a warning but does NOT 
+          crash the application.
+
+MODULE-LEVEL OBJECTS:
+  - email_service = EmailService() --> Singleton used by auth.py.
+
+--------------------------------------------------------------------------------
+FILE 8: backend/services/mongodb_service.py (THE FILING CABINET - Permanent Storage)
+--------------------------------------------------------------------------------
+Purpose: Manages the connection to MongoDB for long-term storage of security 
+         events. While Redis handles real-time data, MongoDB stores permanent 
+         audit logs that survive server restarts.
+
+CLASSES:
+
+  1. MongoDBService
+     - Purpose: Provides async MongoDB operations for the application.
+     
+     METHODS:
+
+     a) __init__(self)
+        - Purpose: Initializes the service with default values.
+        - Sets client and db to None (connected later during startup).
+        - Reads the MongoDB URI from settings.MONGODB_URL.
+
+     b) connect(self) [async]
+        - Purpose: Establishes the connection to MongoDB.
+        - Flow:
+          a) Creates an AsyncIOMotorClient with the configured URI.
+          b) Sends a 'ping' command to verify the connection is alive.
+          c) Sets self.db to the "threatsense_db" database.
+          d) If connection fails, prints error but does NOT crash the app.
+        - Called By: lifespan() in main.py during startup.
+
+     c) close(self) [async]
+        - Purpose: Gracefully closes the MongoDB connection.
+        - Called By: lifespan() in main.py during shutdown.
+
+     d) log_security_event(self, event_data) [async]
+        - Purpose: Inserts a security event document into the 
+          "security_events" collection.
+        - Event Data Structure:
+          * user (str): The username involved.
+          * type (str): Event type (e.g., "TERMINATION").
+          * risk_score (float): The risk score at the time of the event.
+          * timestamp (datetime): When the event occurred.
+          * details (dict): Full ML analysis results.
+        - Safety: Only inserts if self.db is not None (MongoDB is connected).
+        - Called By: log_action() in actions.py when risk >= 70.
+
+MODULE-LEVEL OBJECTS:
+  - mongodb_service = MongoDBService() --> Singleton used by main.py and actions.py.
+
+--------------------------------------------------------------------------------
+FILE 9: backend/ml/detector.py (THE AI BRAIN - Machine Learning Engine)
+--------------------------------------------------------------------------------
+Purpose: The core intelligence of ThreatSense. Loads pre-trained ML artifacts 
+         and performs real-time anomaly detection on every user action. Uses 
+         three types of behavioral analysis: Temporal, Volume, and Sequential.
+
+CLASSES:
+
+  1. AnomalyDetector
+     - Purpose: Loads the trained Random Forest model and performs predictions.
+     
+     METHODS:
+
+     a) __init__(self)
+        - Purpose: Loads all 5 pre-trained ML artifacts from .pkl files.
+        - Artifacts Loaded:
+          * behavior_anomaly_model.pkl --> The trained Random Forest Classifier.
+          * encoders.pkl --> LabelEncoders for categorical features 
+            (user, department, log_type, etc.).
+          * feature_cols.pkl --> The exact column order used during training 
+            (ensures prediction input matches training input).
+          * user_hour_stats.pkl --> Per-user hourly activity statistics 
+            (mean hour, std deviation) for temporal analysis.
+          * user_volume_stats.pkl --> Per-user volume statistics 
+            (mean files per hour, std deviation) for volume analysis.
+        - Path: Artifacts are stored in the project root (one level above backend/).
+
+     b) predict(self, log_entry: dict, user_history: list) -> dict
+        - Purpose: The main prediction function. Analyzes a single user action 
+          and returns whether it is anomalous.
+        - Input:
+          * log_entry: Dictionary with keys (user, log_type, department, 
+            file_accessed, location, device_type, timestamp).
+          * user_history: List of recent actions from Redis sliding window.
+        
+        - ANALYSIS PIPELINE (6 Steps):
+
+          Step 1: Basic Time Features
+            - Extracts hour, day_of_week, is_weekend from the timestamp.
+            - Error Handling: If timestamp is invalid, uses current UTC time.
+
+          Step 2: Temporal Analysis (Z-Score)
+            - Compares the current hour against the user's historical 
+              average login hour (from user_hour_stats).
+            - Formula: temporal_zscore = |hour - mean| / std
+            - If zscore > 2: temporal_anomaly = 1 (flagged).
+            - Example: If a user normally logs in at 10 AM but suddenly 
+              appears at 3 AM, the zscore will be very high.
+
+          Step 3: Volume Analysis (Z-Score)
+            - Counts how many actions this user has performed in the 
+              current sliding window (from Redis history).
+            - Compares against their historical average volume.
+            - Formula: volume_zscore = |files_per_hour - mean| / std
+            - If zscore > 2: volume_anomaly = 1 (flagged).
+            - Example: If a user normally accesses 5 files/hour but 
+              suddenly accesses 50, this is flagged.
+
+          Step 4: Sequential Analysis (Transition Probability)
+            - Looks at the LAST file accessed (from user_history) and 
+              compares it to the CURRENT file.
+            - If same file: transition_prob = 0.5 (normal, re-reading).
+            - If different file: transition_prob = 0.05 (suspicious jump).
+            - If transition_prob < 0.1: sequential_anomaly = 1 (flagged).
+            - Example: Jumping from "payroll.xlsx" to "admin_passwords.db" 
+              would be a suspicious transition.
+
+          Step 5: Combined Anomaly Score
+            - Weighted combination of all three analyses:
+              anomaly_score = 0.4 * temporal_zscore 
+                            + 0.3 * volume_zscore 
+                            + 0.3 * (1 - transition_prob) * 10
+            - This single number represents "How suspicious is this action?"
+
+          Step 6: Categorical Encoding & Model Prediction
+            - Encodes categorical features (user, department, etc.) using 
+              the pre-trained LabelEncoders.
+            - Handles unseen labels by defaulting encoded value to 0.
+            - Creates a Pandas DataFrame matching the training schema.
+            - Calls model.predict() for binary classification (0 or 1).
+            - Calls model.predict_proba() for confidence percentage.
+
+        - RETURNS (dict):
+          * is_anomaly (bool): True if the model classifies this as an attack.
+          * confidence (float): How confident the model is (0.0 to 1.0).
+          * anomaly_score (float): The raw combined score.
+          * details (dict): Breakdown of which analysis flagged:
+            - temporal: "flagged" or "normal"
+            - volume: "flagged" or "normal"
+            - sequential: "flagged" or "normal"
+
+================================================================================
+                         REDIS KEY SCHEMA
+================================================================================
+
+Key Pattern                    | Type   | Purpose
+-------------------------------|--------|----------------------------------------
+session:{user_id}              | String | User session state: "PENDING" or "ACTIVE"
+token:{uuid}                   | String | Maps verification/kill token to user_id
+actions:{user_id}              | List   | Sliding window of recent user actions (JSON)
+risk:{user_id}                 | String | Current risk score (float as string)
+
+================================================================================
+                         MONGODB SCHEMA
+================================================================================
+
+Database: threatsense_db
+Collection: security_events
+
+Document Structure:
+{
+    "_id": ObjectId (auto-generated),
+    "user": "finance_user01",
+    "type": "TERMINATION",
+    "risk_score": 72.45,
+    "timestamp": ISODate("2026-02-25T00:06:12Z"),
+    "details": {
+        "is_anomaly": true,
+        "confidence": 0.87,
+        "anomaly_score": 85.3,
+        "details": {
+            "temporal": "flagged",
+            "volume": "flagged",
+            "sequential": "normal"
+        }
+    }
+}
+
+================================================================================
+                         API ENDPOINTS SUMMARY
+================================================================================
+
+Method | Endpoint                              | Purpose
+-------|---------------------------------------|------------------------------------
+GET    | /                                     | Health check
+POST   | /api/auth/login                       | Initiate login + send email
+GET    | /api/auth/verify/{token}              | Verify "Yes, I'm In" click
+GET    | /api/auth/report_compromise/{token}   | Handle "This is not me" click
+POST   | /api/actions/log                      | Log action + ML analysis + risk update
+WS     | /ws/ws/{user_id}                      | WebSocket connection for real-time alerts
+
+================================================================================
+                         FOLDER STRUCTURE
+================================================================================
+
+threatsense/
+  |-- behavior_anomaly_model.pkl     (Trained ML model)
+  |-- encoders.pkl                   (Label encoders for categorical data)
+  |-- feature_cols.pkl               (Feature column order)
+  |-- user_hour_stats.pkl            (Per-user hourly statistics)
+  |-- user_volume_stats.pkl          (Per-user volume statistics)
+  |
+  |-- backend/
+       |-- main.py                   (Entry point, lifespan, CORS, routers)
+       |-- requirements.txt          (Python dependencies)
+       |
+       |-- core/
+       |    |-- config.py            (Settings: API keys, DB URLs, secrets)
+       |
+       |-- api/
+       |    |-- auth.py              (Login, Verify, Report Compromise)
+       |    |-- actions.py           (Log Action, ML Analysis, Risk Update)
+       |    |-- websocket.py         (WebSocket Manager, Termination Signal)
+       |
+       |-- services/
+       |    |-- redis_service.py     (Redis operations + Fake Memory fallback)
+       |    |-- email_service.py     (SendGrid email + Magic Link generation)
+       |    |-- mongodb_service.py   (MongoDB connection + Event logging)
+       |
+       |-- ml/
+            |-- detector.py          (AnomalyDetector: ML prediction engine)
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================
